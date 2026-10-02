@@ -182,6 +182,15 @@ class TestSessionStartHook:
         self._write_handoff(relay, "   ")
         assert cr.handle_session_start({"source": "clear", "cwd": str(relay / "proj")}) is None
 
+    def test_long_paths_still_fit_under_cap(self, relay, monkeypatch):
+        # Windows temp paths are long; the header + truncation note must still fit.
+        monkeypatch.setenv("CONTEXT_RELAY_HOME", str(relay / ("deep" * 40)))
+        self._write_handoff(relay, "x" * 20_000)
+        ctx = cr.handle_session_start({"source": "clear", "cwd": str(relay / "proj")})["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        assert len(ctx) <= cr.MAX_INJECT_CHARS
+
     def test_oversized_handoff_truncated(self, relay):
         self._write_handoff(relay, "x" * 20_000)
         ctx = cr.handle_session_start({"source": "clear", "cwd": str(relay / "proj")})["hookSpecificOutput"][

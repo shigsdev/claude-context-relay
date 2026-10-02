@@ -43,8 +43,8 @@ from pathlib import Path
 DEFAULT_THRESHOLD = 0.60
 DEFAULT_WINDOW = 200_000
 DEFAULT_MAX_AGE_H = 24.0
-# Claude Code caps SessionStart additionalContext at ~10k chars.
-MAX_INJECT_CHARS = 9_000
+# Claude Code caps SessionStart additionalContext at ~10k chars (total, header included).
+MAX_INJECT_CHARS = 9_500
 
 
 # ── config ──────────────────────────────────────────────────────────────────
@@ -259,15 +259,19 @@ def handle_session_start(payload: dict) -> dict | None:
     consumed = pdir / "archive" / f"{_stamp()}-restored.md"
     consumed.parent.mkdir(exist_ok=True)
     shutil.move(str(latest), consumed)
-    if len(text) > MAX_INJECT_CHARS:
-        text = text[:MAX_INJECT_CHARS] + f"\n\n[...truncated -- read {consumed.as_posix()} for the rest]"
-    context = (
+    header = (
         "CONTEXT RELAY: this session continues work from a previous session that was cleared "
         f"to free up context (handoff written {int(age // 60)} min ago, archived at "
         f"{consumed.as_posix()}; full transcripts are in {(pdir / 'history').as_posix()}). "
         "Treat the handoff below as your working memory. Briefly confirm to the user what you are "
-        "picking up, then continue with the next step unless they redirect you.\n\n" + text
+        "picking up, then continue with the next step unless they redirect you.\n\n"
     )
+    # The cap applies to the whole injected string; long (e.g. Windows) paths eat into it.
+    budget = MAX_INJECT_CHARS - len(header)
+    if len(text) > budget:
+        note = f"\n\n[...truncated -- read {consumed.as_posix()} for the rest]"
+        text = text[: max(budget - len(note), 0)] + note
+    context = header + text
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
 
