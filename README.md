@@ -55,8 +55,23 @@ Set these in `~/.claude/settings.json` → `"env": {...}`:
 | Variable | Default | Meaning |
 |---|---|---|
 | `CONTEXT_RELAY_THRESHOLD` | `0.60` | Fraction of the window that triggers a handoff |
-| `CONTEXT_RELAY_WINDOW` | `200000` | Context window size (use `1000000` for 1M-context models) |
+| `CONTEXT_RELAY_WINDOW` | auto | Force the context window size in tokens (normally not needed, see below) |
 | `CONTEXT_RELAY_MAX_AGE_H` | `24` | Ignore older handoffs on a plain startup |
+
+### Window size detection
+
+Hooks aren't told the context window size, so it's resolved in this order:
+
+1. `CONTEXT_RELAY_WINDOW`, if set.
+2. The size Claude Code reports to the status line for that session. The status line (`--statusline`)
+   records it, so with it installed 200k and 1M sessions are told apart exactly, even side by side.
+3. A `[1m]` model in `ANTHROPIC_MODEL` or in `~/.claude/settings.json` / the project's
+   `.claude/settings*.json`.
+4. More than 200k tokens in use, which only an extended window can hold.
+5. Otherwise 200k.
+
+On a 1M window the default 60% threshold means ~600k tokens. If you'd rather hand off sooner,
+lower `CONTEXT_RELAY_THRESHOLD` (e.g. `0.3` = ~300k).
 
 ## Files
 
@@ -66,4 +81,5 @@ Set these in `~/.claude/settings.json` → `"env": {...}`:
   archive/         every handoff written / restored
   history/         full transcript copies (.jsonl) at each handoff & compaction
   state.json       per-session bookkeeping
+~/.claude/handoffs/windows.json   window size per session, recorded by the status line
 ```

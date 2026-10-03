@@ -53,6 +53,8 @@ def relay(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTEXT_RELAY_WINDOW", "100000")
     monkeypatch.setenv("CONTEXT_RELAY_THRESHOLD", "0.5")
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.setattr(cr.Path, "home", lambda: tmp_path)
     return tmp_path
 
 
@@ -73,11 +75,9 @@ def _payload(relay: Path, tokens: int, **extra) -> dict:
 
 
 class TestConfig:
-    def test_defaults(self, monkeypatch):
-        for name in ("CONTEXT_RELAY_THRESHOLD", "CONTEXT_RELAY_WINDOW"):
-            monkeypatch.delenv(name, raising=False)
+    def test_default_threshold(self, monkeypatch):
+        monkeypatch.delenv("CONTEXT_RELAY_THRESHOLD", raising=False)
         assert cr.threshold() == cr.DEFAULT_THRESHOLD
-        assert cr.window() == cr.DEFAULT_WINDOW
 
     @pytest.mark.parametrize("value", ["abc", "-1", "0", "1.5"])
     def test_bad_threshold_falls_back(self, monkeypatch, value):
@@ -93,6 +93,76 @@ class TestConfig:
     def test_project_slug_is_filesystem_safe(self):
         assert cr.project_slug("C:\\shigsapps\\windesktopmgr") == "C-shigsapps-windesktopmgr"
         assert cr.project_slug("") == "unknown"
+
+
+class TestWindowDetection:
+    @pytest.fixture
+    def auto(self, relay, monkeypatch):
+        monkeypatch.delenv("CONTEXT_RELAY_WINDOW")
+        return relay
+
+    def _settings(self, path: Path, model: str) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "settings.json").write_text(json.dumps({"model": model}), encoding="utf-8")
+
+    def test_default_is_200k(self, auto):
+        assert cr.window("s1", 50_000, str(auto / "proj")) == cr.DEFAULT_WINDOW
+
+    def test_env_override_wins(self, auto, monkeypatch):
+        monkeypatch.setenv("CONTEXT_RELAY_WINDOW", "500000")
+        cr.record_window("s1", 1_000_000)
+        assert cr.window("s1") == 500_000
+
+    def test_statusline_records_reported_size(self, auto):
+        cr.handle_statusline({"session_id": "s1", "context_window": {"context_window_size": 1_000_000}})
+        assert cr.window("s1") == 1_000_000
+        assert cr.window("other") == cr.DEFAULT_WINDOW
+
+    def test_statusline_display_uses_reported_size(self, auto):
+        payload = _payload(auto, 135_000, context_window={"context_window_size": 1_000_000})
+        assert cr.handle_statusline(payload) == "ctx 14% (135k/1000k)"
+
+    def test_user_settings_1m_model(self, auto):
+        self._settings(auto / ".claude", "opus[1m]")
+        assert cr.window("s1", 50_000, str(auto / "proj")) == cr.EXTENDED_WINDOW
+
+    def test_project_settings_1m_model(self, auto):
+        self._settings(auto / "proj" / ".claude", "sonnet[1M]")
+        assert cr.window("s1", 50_000, str(auto / "proj")) == cr.EXTENDED_WINDOW
+
+    def test_anthropic_model_env(self, auto, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-opus-5-5[1m]")
+        assert cr.window("s1") == cr.EXTENDED_WINDOW
+
+    def test_over_200k_in_use_implies_extended(self, auto):
+        assert cr.window("s1", 250_000) == cr.EXTENDED_WINDOW
+
+    def test_unreadable_settings_ignored(self, auto):
+        (auto / ".claude").mkdir()
+        (auto / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
+        assert cr.window("s1", 1, str(auto)) == cr.DEFAULT_WINDOW
+
+    def test_record_window_keeps_50_most_recent(self, auto):
+        for i in range(60):
+            cr.record_window(f"s{i}", 1_000_000)
+        cr.record_window("s5", 200_000)  # re-recorded -> most recent, survives
+        windows = cr._load_windows()
+        assert len(windows) == 50
+        assert windows["s5"] == 200_000
+        assert "s10" not in windows
+
+    def test_1m_session_at_135k_does_not_hand_off(self, auto):
+        # Regression: a 1M session at 135k was reported as "68% (135k/200k)" and handed off.
+        payload = _payload(auto, 135_000)
+        cr.handle_statusline({**payload, "context_window": {"context_window_size": 1_000_000}})
+        assert cr.handle_stop(payload) is None
+
+    def test_1m_session_hands_off_at_threshold(self, auto):
+        payload = _payload(auto, 700_000)
+        cr.record_window(payload["session_id"], 1_000_000)
+        result = cr.handle_stop(payload)
+        assert result["decision"] == "block"
+        assert "(700k/1000k tokens)" in result["reason"]
 
 
 class TestContextTokens:

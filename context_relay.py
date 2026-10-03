@@ -24,7 +24,8 @@ stay clean:
 
 Tunables (environment variables, e.g. in settings.json "env"):
   CONTEXT_RELAY_THRESHOLD   fraction of the window that triggers a handoff (0.60)
-  CONTEXT_RELAY_WINDOW      context window size in tokens (200000)
+  CONTEXT_RELAY_WINDOW      force the context window size in tokens (default: auto-detect,
+                            see window())
   CONTEXT_RELAY_MAX_AGE_H   never restore handoffs older than this (24)
   CONTEXT_RELAY_HOME        override ~/.claude/handoffs (used by tests)
 """
@@ -42,6 +43,7 @@ from pathlib import Path
 
 DEFAULT_THRESHOLD = 0.60
 DEFAULT_WINDOW = 200_000
+EXTENDED_WINDOW = 1_000_000
 DEFAULT_MAX_AGE_H = 24.0
 # Claude Code caps SessionStart additionalContext at ~10k chars (total, header included).
 MAX_INJECT_CHARS = 9_500
@@ -63,8 +65,64 @@ def threshold() -> float:
     return value if value < 1 else DEFAULT_THRESHOLD
 
 
-def window() -> int:
-    return int(_env_float("CONTEXT_RELAY_WINDOW", DEFAULT_WINDOW))
+def window(session_id: str = "", tokens: int = 0, cwd: str = "") -> int:
+    """Context window size, most authoritative source first.
+
+    1. CONTEXT_RELAY_WINDOW -- explicit override.
+    2. The size Claude Code reported to the status line for this session
+       (hooks aren't told the window size; the status line is).
+    3. A "[1m]" model in ANTHROPIC_MODEL or any settings.json in scope.
+    4. More than 200k tokens in use -- can only be an extended window.
+    5. 200k.
+    """
+    forced = _env_float("CONTEXT_RELAY_WINDOW", 0)
+    if forced:
+        return int(forced)
+    recorded = _load_windows().get(session_id) if session_id else None
+    if isinstance(recorded, int) and recorded > 0:
+        return recorded
+    if _configured_extended(cwd) or tokens > DEFAULT_WINDOW:
+        return EXTENDED_WINDOW
+    return DEFAULT_WINDOW
+
+
+def _configured_extended(cwd: str) -> bool:
+    models = [os.environ.get("ANTHROPIC_MODEL", "")]
+    paths = [Path.home() / ".claude" / "settings.json"]
+    if cwd:
+        paths += [Path(cwd) / ".claude" / "settings.json", Path(cwd) / ".claude" / "settings.local.json"]
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            models.append(str(data.get("model") or ""))
+    return any("[1m]" in m.lower() for m in models)
+
+
+def _windows_file() -> Path:
+    return relay_home() / "windows.json"
+
+
+def _load_windows() -> dict:
+    try:
+        data = json.loads(_windows_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def record_window(session_id: str, size: int) -> None:
+    """Remember a session's window size (called from the status line)."""
+    windows = _load_windows()
+    if not session_id or windows.get(session_id) == size:
+        return
+    windows.pop(session_id, None)
+    windows[session_id] = size
+    recent = dict(list(windows.items())[-50:])  # insertion order = recency
+    _windows_file().parent.mkdir(parents=True, exist_ok=True)
+    _windows_file().write_text(json.dumps(recent), encoding="utf-8")
 
 
 def max_age_seconds() -> float:
@@ -132,10 +190,6 @@ def context_tokens(transcript_path: str) -> int:
     return 0
 
 
-def usage_fraction(transcript_path: str) -> float:
-    return context_tokens(transcript_path) / window()
-
-
 # ── state ───────────────────────────────────────────────────────────────────
 
 
@@ -195,7 +249,8 @@ def handle_stop(payload: dict) -> dict | None:
     cwd = project_root(payload)
 
     tokens = context_tokens(transcript)
-    frac = tokens / window()
+    size = window(session_id, tokens, cwd)
+    frac = tokens / size
     if frac < threshold():
         return None
 
@@ -203,7 +258,7 @@ def handle_stop(payload: dict) -> dict | None:
     latest = pdir / "latest.md"
     state = _load_state(pdir)
     entry = state.get(session_id, {})
-    pct = f"{frac:.0%} ({tokens // 1000}k/{window() // 1000}k tokens)"
+    pct = f"{frac:.0%} ({tokens // 1000}k/{size // 1000}k tokens)"
 
     if entry.get("requested_at"):
         written = latest.exists() and latest.stat().st_mtime >= entry["requested_at"]
@@ -284,10 +339,15 @@ def handle_pre_compact(payload: dict) -> dict | None:
 
 
 def handle_statusline(payload: dict) -> str:
+    session_id = payload.get("session_id") or ""
+    reported = (payload.get("context_window") or {}).get("context_window_size")
+    if isinstance(reported, int) and reported > 0:
+        record_window(session_id, reported)
     tokens = context_tokens(payload.get("transcript_path") or "")
-    frac = tokens / window()
+    size = window(session_id, tokens, project_root(payload))
+    frac = tokens / size
     flag = " -> handoff" if frac >= threshold() else ""
-    return f"ctx {frac:.0%} ({tokens // 1000}k/{window() // 1000}k){flag}"
+    return f"ctx {frac:.0%} ({tokens // 1000}k/{size // 1000}k){flag}"
 
 
 def handle_path(cwd: str) -> str:
@@ -300,11 +360,10 @@ def handle_status(cwd: str) -> str:
     where = f"handoff file: {handle_path(cwd)}"
     if not candidates:
         return f"No transcripts found for {cwd}; {where}"
-    tokens = context_tokens(str(candidates[-1]))
-    return (
-        f"{candidates[-1].name}: {tokens:,} tokens = {tokens / window():.0%} of {window():,} "
-        f"(handoff at {threshold():.0%}); {where}"
-    )
+    latest = candidates[-1]
+    tokens = context_tokens(str(latest))
+    size = window(latest.stem, tokens, cwd)
+    return f"{latest.name}: {tokens:,} tokens = {tokens / size:.0%} of {size:,} (handoff at {threshold():.0%}); {where}"
 
 
 HANDLERS = {"stop": handle_stop, "session-start": handle_session_start, "pre-compact": handle_pre_compact}
