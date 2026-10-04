@@ -4,8 +4,8 @@ One stdlib-only script wired into Claude Code hooks (see install.py):
 
   stop           Stop hook. After each turn, measures context usage from the
                  transcript. Over the threshold -> blocks the stop once and
-                 tells Claude to write a handoff file, then to ask you to
-                 type /clear.
+                 tells Claude to write a handoff file, then to clear the
+                 session itself (desktop app) or ask you to type /clear.
   session-start  SessionStart hook. On /clear (or a fresh start / compaction)
                  injects the pending handoff into the new session's context,
                  then archives it so it is only restored once.
@@ -45,6 +45,8 @@ DEFAULT_THRESHOLD = 0.60
 DEFAULT_WINDOW = 200_000
 EXTENDED_WINDOW = 1_000_000
 DEFAULT_MAX_AGE_H = 24.0
+# Re-request the handoff if a session keeps going this far past its last one.
+REFRESH_TOKENS = 50_000
 # Claude Code caps SessionStart additionalContext at ~10k chars (total, header included).
 MAX_INJECT_CHARS = 9_500
 
@@ -66,24 +68,30 @@ def threshold() -> float:
 
 
 def window(session_id: str = "", tokens: int = 0, cwd: str = "") -> int:
-    """Context window size, most authoritative source first.
+    return detect_window(session_id, tokens, cwd)[0]
+
+
+def detect_window(session_id: str = "", tokens: int = 0, cwd: str = "") -> tuple[int, bool]:
+    """(context window size, whether it was actually detected), most authoritative source first.
 
     1. CONTEXT_RELAY_WINDOW -- explicit override.
     2. The size Claude Code reported to the status line for this session
        (hooks aren't told the window size; the status line is).
     3. A "[1m]" model in ANTHROPIC_MODEL or any settings.json in scope.
     4. More than 200k tokens in use -- can only be an extended window.
-    5. 200k.
+    5. 200k -- a guess. The desktop app runs no status line and picks the model
+       in its UI (transcripts record the plain model id), so a 1M session there
+       lands here until it passes 200k.
     """
     forced = _env_float("CONTEXT_RELAY_WINDOW", 0)
     if forced:
-        return int(forced)
+        return int(forced), True
     recorded = _load_windows().get(session_id) if session_id else None
     if isinstance(recorded, int) and recorded > 0:
-        return recorded
+        return recorded, True
     if _configured_extended(cwd) or tokens > DEFAULT_WINDOW:
-        return EXTENDED_WINDOW
-    return DEFAULT_WINDOW
+        return EXTENDED_WINDOW, True
+    return DEFAULT_WINDOW, False
 
 
 def _configured_extended(cwd: str) -> bool:
@@ -219,6 +227,8 @@ def archive_transcript(transcript_path: str, pdir: Path, session_id: str) -> Pat
 
 # ── hook handlers ───────────────────────────────────────────────────────────
 
+MANUAL_CLEAR = "Handoff saved -- type /clear to continue in a fresh session."
+
 HANDOFF_TEMPLATE = """\
 # Handoff -- <one-line goal>
 
@@ -249,7 +259,7 @@ def handle_stop(payload: dict) -> dict | None:
     cwd = project_root(payload)
 
     tokens = context_tokens(transcript)
-    size = window(session_id, tokens, cwd)
+    size, known = detect_window(session_id, tokens, cwd)
     frac = tokens / size
     if frac < threshold():
         return None
@@ -260,6 +270,7 @@ def handle_stop(payload: dict) -> dict | None:
     entry = state.get(session_id, {})
     pct = f"{frac:.0%} ({tokens // 1000}k/{size // 1000}k tokens)"
 
+    refresh = ""
     if entry.get("requested_at"):
         written = latest.exists() and latest.stat().st_mtime >= entry["requested_at"]
         if written and not entry.get("archived"):
@@ -269,24 +280,48 @@ def handle_stop(payload: dict) -> dict | None:
             history = archive_transcript(transcript, pdir, session_id)
             entry.update(archived=str(archived), history=str(history) if history else None)
             _save_state(pdir, state)
-        if written:
-            return {"systemMessage": f"Context relay: handoff saved, context at {pct}. Type /clear to continue fresh."}
+            return {"systemMessage": f"Context relay: handoff saved and archived, context at {pct}."}
         # Asked once already and Claude didn't write it -- never loop.
         if payload.get("stop_hook_active"):
             return None
-        return {"systemMessage": f"Context relay: context at {pct}; no handoff written yet. Run /handoff, then /clear."}
+        if tokens - int(entry.get("tokens") or 0) < REFRESH_TOKENS:
+            if written or entry.get("reminded"):
+                return None  # said it once; don't repeat on every turn
+            entry["reminded"] = True
+            _save_state(pdir, state)
+            return {"systemMessage": f"Context relay: context at {pct}; no handoff written yet. Run /handoff."}
+        # The session kept going well past its handoff -- refresh latest.md so a later
+        # session start doesn't restore a stale one.
+        refresh = "The handoff requested earlier in this session is out of date (work continued). "
 
     state[session_id] = {"requested_at": time.time(), "tokens": tokens}
     _save_state(pdir, state)
+    if known:
+        step2 = (
+            "2. Then clear the session automatically: if the "
+            "mcp__ccd_session_mgmt__clear_session tool exists (load it via ToolSearch if deferred), "
+            "call it with session_id 'self' -- the clear runs when this turn ends and the handoff is "
+            "restored into the fresh session. End your turn with one short line: "
+            "'Handoff saved -- clearing to a fresh session.'\n"
+            "   Only if that tool is missing or refuses (e.g. Remote Control is active or the session "
+            f"is pinned), end your turn with one short line telling the user why and: '{MANUAL_CLEAR}'"
+        )
+    else:
+        # A false trigger on a larger window must not wipe the session, so leave the clear to the user.
+        step2 = (
+            "2. Do NOT clear the session: the context window size could not be detected and "
+            f"{size // 1000}k was assumed, so this handoff may be premature. End your turn with: "
+            f"'{MANUAL_CLEAR} (Window size unknown -- assumed {size // 1000}k. If your window is larger, "
+            "set CONTEXT_RELAY_WINDOW, e.g. python install.py --window 1000000, and keep working.)'"
+        )
     reason = (
-        f"CONTEXT RELAY: context is at {pct}, over the {threshold():.0%} handoff threshold. "
+        f"CONTEXT RELAY: context is at {pct}, over the {threshold():.0%} handoff threshold. {refresh}"
         "Do not start new work. Write a handoff so a fresh session can continue seamlessly:\n"
         f"1. Write the file {latest.as_posix()} (overwrite it) using this structure, filled in "
         "specifically -- file paths, commands, exact error messages; a stranger must be able to "
         "resume from it alone. Keep it under ~1,200 words:\n\n"
         f"{HANDOFF_TEMPLATE}\n"
-        "2. Then end your turn with one short line telling the user: "
-        "'Handoff saved -- type /clear to continue in a fresh session.'"
+        f"{step2}"
     )
     return {"decision": "block", "reason": reason}
 
@@ -318,7 +353,8 @@ def handle_session_start(payload: dict) -> dict | None:
         "CONTEXT RELAY: this session continues work from a previous session that was cleared "
         f"to free up context (handoff written {int(age // 60)} min ago, archived at "
         f"{consumed.as_posix()}; full transcripts are in {(pdir / 'history').as_posix()}). "
-        "Treat the handoff below as your working memory. Briefly confirm to the user what you are "
+        "Treat the handoff below as your working memory; where it disagrees with the repo "
+        "(git status / log), trust the repo. Briefly confirm to the user what you are "
         "picking up, then continue with the next step unless they redirect you.\n\n"
     )
     # The cap applies to the whole injected string; long (e.g. Windows) paths eat into it.
@@ -362,8 +398,12 @@ def handle_status(cwd: str) -> str:
         return f"No transcripts found for {cwd}; {where}"
     latest = candidates[-1]
     tokens = context_tokens(str(latest))
-    size = window(latest.stem, tokens, cwd)
-    return f"{latest.name}: {tokens:,} tokens = {tokens / size:.0%} of {size:,} (handoff at {threshold():.0%}); {where}"
+    size, known = detect_window(latest.stem, tokens, cwd)
+    guess = "" if known else " (window size unknown -- assumed; set CONTEXT_RELAY_WINDOW if larger)"
+    return (
+        f"{latest.name}: {tokens:,} tokens = {tokens / size:.0%} of {size:,}{guess} "
+        f"(handoff at {threshold():.0%}); {where}"
+    )
 
 
 HANDLERS = {"stop": handle_stop, "session-start": handle_session_start, "pre-compact": handle_pre_compact}

@@ -3,13 +3,15 @@
 Covers:
   - context_tokens(): last main-thread assistant usage, skips sidechains/garbage
   - Stop hook: below threshold no-op; over threshold blocks once; handoff
-    written -> archived + /clear reminder; never loops on stop_hook_active
+    written -> archived once, no repeated messages; never loops on
+    stop_hook_active; desktop clear_session with /clear fallback, but no
+    auto-clear on a guessed window; re-requested after +50k tokens
   - SessionStart hook: injects + archives on clear, ignores resume, archives
     stale handoffs instead of restoring them, truncates oversized handoffs
   - project_root(): CLAUDE_PROJECT_DIR beats a drifted cwd; path/status CLI
   - PreCompact hook: copies the transcript to history/
   - main(): bad payloads never raise, unknown command exits 1
-  - install.py: merges hooks idempotently, keeps foreign hooks, uninstalls
+  - install.py: merges hooks idempotently, keeps foreign hooks, --window env, uninstalls
 """
 
 from __future__ import annotations
@@ -107,6 +109,14 @@ class TestWindowDetection:
 
     def test_default_is_200k(self, auto):
         assert cr.window("s1", 50_000, str(auto / "proj")) == cr.DEFAULT_WINDOW
+
+    def test_only_the_fallback_is_a_guess(self, auto, monkeypatch):
+        assert cr.detect_window("s1", 50_000) == (cr.DEFAULT_WINDOW, False)
+        assert cr.detect_window("s1", 250_000) == (cr.EXTENDED_WINDOW, True)
+        cr.record_window("s1", 200_000)
+        assert cr.detect_window("s1", 50_000) == (200_000, True)
+        monkeypatch.setenv("CONTEXT_RELAY_WINDOW", "1000000")
+        assert cr.detect_window("s2", 50_000) == (1_000_000, True)
 
     def test_env_override_wins(self, auto, monkeypatch):
         monkeypatch.setenv("CONTEXT_RELAY_WINDOW", "500000")
@@ -209,10 +219,47 @@ class TestStopHook:
 
         first = cr.handle_stop({**payload, "stop_hook_active": True})
         second = cr.handle_stop(payload)
-        assert "/clear" in first["systemMessage"]
-        assert "/clear" in second["systemMessage"]
+        assert "handoff saved" in first["systemMessage"]
+        assert second is None  # no repeat on later turns
         assert len(list((pdir / "archive").glob("*.md"))) == 1
         assert len(list((pdir / "history").glob("*.jsonl"))) == 1
+
+    def test_reminder_is_not_repeated(self, relay):
+        cr.handle_stop(_payload(relay, 60_000))
+        assert cr.handle_stop(_payload(relay, 62_000)) is not None
+        assert cr.handle_stop(_payload(relay, 64_000)) is None
+
+    def test_known_window_clears_via_desktop_tool_with_fallback(self, relay):
+        reason = cr.handle_stop(_payload(relay, 60_000))["reason"]
+        assert "mcp__ccd_session_mgmt__clear_session" in reason
+        assert "session_id 'self'" in reason
+        assert cr.MANUAL_CLEAR in reason
+
+    def test_guessed_window_does_not_auto_clear(self, relay, monkeypatch):
+        # Regression: a desktop-app 1M session at 145k was handed off as "73% (145k/200k)".
+        monkeypatch.delenv("CONTEXT_RELAY_WINDOW")
+        reason = cr.handle_stop(_payload(relay, 145_000))["reason"]
+        assert "clear_session" not in reason
+        assert "Do NOT clear" in reason
+        assert "CONTEXT_RELAY_WINDOW" in reason
+
+    def test_session_that_continues_gets_handoff_refreshed(self, relay):
+        payload = _payload(relay, 60_000)
+        cr.handle_stop(payload)
+        pdir = cr.project_dir(payload["cwd"])
+        (pdir / "latest.md").write_text("# Handoff -- old", encoding="utf-8")
+        future = time.time() + 5
+        os.utime(pdir / "latest.md", (future, future))
+        cr.handle_stop({**payload, "stop_hook_active": True})  # archives
+
+        assert cr.handle_stop(_payload(relay, 60_000 + cr.REFRESH_TOKENS - 1)) is None
+        again = cr.handle_stop(_payload(relay, 60_000 + cr.REFRESH_TOKENS))
+        assert again["decision"] == "block"
+        assert "out of date" in again["reason"]
+
+    def test_refresh_never_blocks_a_continuation(self, relay):
+        cr.handle_stop(_payload(relay, 60_000))
+        assert cr.handle_stop(_payload(relay, 60_000 + cr.REFRESH_TOKENS, stop_hook_active=True)) is None
 
 
 class TestSessionStartHook:
@@ -323,6 +370,10 @@ class TestMain:
         monkeypatch.setattr(cr.Path, "home", lambda: relay)
         _, out = self._run(monkeypatch, capsys, ["status", project])
         assert "40,000 tokens = 40%" in out.out
+        assert "assumed" not in out.out
+        monkeypatch.delenv("CONTEXT_RELAY_WINDOW")
+        _, out = self._run(monkeypatch, capsys, ["status", project])
+        assert "of 200,000 (window size unknown -- assumed" in out.out
 
     def test_handler_crash_never_breaks_session(self, monkeypatch, capsys):
         monkeypatch.setitem(cr.HANDLERS, "stop", lambda _p: 1 / 0)
@@ -382,9 +433,26 @@ class TestInstall:
         assert json.loads((home / "settings.json").read_text())["statusLine"]["command"] == "mine"
         assert any("left it alone" in line for line in log)
 
+    def test_window_flag_sets_env_and_rerun_keeps_it(self, tmp_path):
+        home = tmp_path / ".claude"
+        home.mkdir()
+        (home / "settings.json").write_text(json.dumps({"env": {"OTHER": "1"}}))
+        ci.run(home, window=1_000_000)
+        ci.run(home)
+        assert json.loads((home / "settings.json").read_text())["env"] == {
+            "OTHER": "1",
+            "CONTEXT_RELAY_WINDOW": "1000000",
+        }
+        ci.run(home, uninstall=True)
+        assert json.loads((home / "settings.json").read_text())["env"] == {"OTHER": "1"}
+
+    def test_window_flag_rejects_nonpositive(self, tmp_path):
+        with pytest.raises(SystemExit):
+            ci.main(["--claude-home", str(tmp_path / ".claude"), "--window", "0"])
+
     def test_uninstall_removes_only_ours(self, tmp_path):
         home = tmp_path / ".claude"
-        ci.run(home, statusline=True)
+        ci.run(home, statusline=True, window=1_000_000)
         ci.run(home, uninstall=True)
         settings = json.loads((home / "settings.json").read_text())
         assert settings == {}
