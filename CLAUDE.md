@@ -13,4 +13,8 @@ Rules:
 - Stop hook must never loop -- respect `stop_hook_active`.
 - SessionStart `additionalContext` is capped at ~10k chars by Claude Code.
 
-Before committing: `ruff check . && ruff format . && pytest`.
+Before committing: `ruff check . && ruff format . && pytest`. `tests/test_smoke.py` runs the
+installed hook commands as subprocesses per host profile (CLI + status line, desktop app with and
+without `--window`). Keep its profiles in sync when host behavior changes.
+After changing hook output, Claude's instructions, `/handoff` or `install.py`, also run the
+manual checks in `SMOKE.md` for each affected host. Unit tests can't see host differences.
