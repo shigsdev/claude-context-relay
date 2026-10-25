@@ -2,7 +2,7 @@
 
   python install.py             # install / update
   python install.py --statusline # also set the status line
-  python install.py --window 1000000  # fix the window size (desktop app + 1M model)
+  python install.py --window 1000000  # force the window size (only if auto-detection gets it wrong)
   python install.py --uninstall
 
 Copies context_relay.py to ~/.claude/hooks/, handoff.md to
@@ -11,9 +11,9 @@ and PreCompact hooks into ~/.claude/settings.json. Re-running is safe: our
 own entries are replaced, everything else in settings.json is kept, and a
 timestamped settings.json.bak-<time> copy is written first.
 
---window sets "env": {"CONTEXT_RELAY_WINDOW": ...}. The desktop app doesn't
-run status line commands, so the hook can't learn the window size there;
-without it a 1M session is treated as 200k. It applies to every session.
+--window sets "env": {"CONTEXT_RELAY_WINDOW": ...}. The hook detects the window
+from the status line or the transcript's model id, so this is only needed for a
+model it doesn't recognize. It applies to every session.
 """
 
 from __future__ import annotations

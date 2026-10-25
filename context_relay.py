@@ -44,6 +44,10 @@ from pathlib import Path
 DEFAULT_THRESHOLD = 0.60
 DEFAULT_WINDOW = 200_000
 EXTENDED_WINDOW = 1_000_000
+# Model ids (as transcripts record them, plain -- no "[1m]") by standard window size. Searched,
+# not matched, so Bedrock/Vertex ids ("us.anthropic.claude-opus-4-8-v1") work too.
+EXTENDED_MODELS = re.compile(r"claude-(?:opus-4-[6-9]|sonnet-4-6|(?:opus|sonnet|haiku)-[5-9]|fable|mythos)")
+DEFAULT_MODELS = re.compile(r"claude-(?:3|haiku-4-5|sonnet-4-5|opus-4-[15]|(?:opus|sonnet)-4-\d{8})")
 DEFAULT_MAX_AGE_H = 24.0
 # Re-request the handoff if a session keeps going this far past its last one.
 REFRESH_TOKENS = 50_000
@@ -67,11 +71,11 @@ def threshold() -> float:
     return value if value < 1 else DEFAULT_THRESHOLD
 
 
-def window(session_id: str = "", tokens: int = 0, cwd: str = "") -> int:
-    return detect_window(session_id, tokens, cwd)[0]
+def window(session_id: str = "", tokens: int = 0, cwd: str = "", model: str = "") -> int:
+    return detect_window(session_id, tokens, cwd, model)[0]
 
 
-def detect_window(session_id: str = "", tokens: int = 0, cwd: str = "") -> tuple[int, bool]:
+def detect_window(session_id: str = "", tokens: int = 0, cwd: str = "", model: str = "") -> tuple[int, bool]:
     """(context window size, whether it was actually detected), most authoritative source first.
 
     1. CONTEXT_RELAY_WINDOW -- explicit override.
@@ -79,9 +83,10 @@ def detect_window(session_id: str = "", tokens: int = 0, cwd: str = "") -> tuple
        (hooks aren't told the window size; the status line is).
     3. A "[1m]" model in ANTHROPIC_MODEL or any settings.json in scope.
     4. More than 200k tokens in use -- can only be an extended window.
-    5. 200k -- a guess. The desktop app runs no status line and picks the model
-       in its UI (transcripts record the plain model id), so a 1M session there
-       lands here until it passes 200k.
+    5. The transcript's model id: current models (Opus 4.6+, Sonnet 4.6+, Haiku 5+,
+       Fable, Mythos) have a native 1M window; older ones are 200k unless "[1m]" (3.).
+       This is what covers the desktop app, which runs no status line.
+    6. 200k -- a guess, for a model id not listed above.
     """
     forced = _env_float("CONTEXT_RELAY_WINDOW", 0)
     if forced:
@@ -91,6 +96,10 @@ def detect_window(session_id: str = "", tokens: int = 0, cwd: str = "") -> tuple
         return recorded, True
     if _configured_extended(cwd) or tokens > DEFAULT_WINDOW:
         return EXTENDED_WINDOW, True
+    if EXTENDED_MODELS.search(model):
+        return EXTENDED_WINDOW, True
+    if DEFAULT_MODELS.search(model):
+        return DEFAULT_WINDOW, True
     return DEFAULT_WINDOW, False
 
 
@@ -171,16 +180,20 @@ def _stamp() -> str:
 
 
 def context_tokens(transcript_path: str) -> int:
-    """Tokens in context as of the last main-thread assistant message.
+    return transcript_usage(transcript_path)[0]
+
+
+def transcript_usage(transcript_path: str) -> tuple[int, str]:
+    """(tokens in context, model id) as of the last main-thread assistant message.
 
     input + cache_creation + cache_read is what the model was sent; adding
-    output gives what the next request will start from. 0 if unreadable.
+    output gives what the next request will start from. (0, "") if unreadable.
     """
     try:
         with open(transcript_path, encoding="utf-8") as fh:
             lines = fh.readlines()
     except (OSError, TypeError):
-        return 0
+        return 0, ""
     for line in reversed(lines):
         try:
             entry = json.loads(line)
@@ -188,14 +201,15 @@ def context_tokens(transcript_path: str) -> int:
             continue
         if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain"):
             continue
-        usage = (entry.get("message") or {}).get("usage") or {}
+        message = entry.get("message") or {}
+        usage = message.get("usage") or {}
         total = sum(
             int(usage.get(key) or 0)
             for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
         )
-        if total:
-            return total
-    return 0
+        if total:  # skips synthetic messages (e.g. API errors), which carry no usage or real model
+            return total, str(message.get("model") or "")
+    return 0, ""
 
 
 # ── state ───────────────────────────────────────────────────────────────────
@@ -258,8 +272,8 @@ def handle_stop(payload: dict) -> dict | None:
     session_id = payload.get("session_id") or "unknown"
     cwd = project_root(payload)
 
-    tokens = context_tokens(transcript)
-    size, known = detect_window(session_id, tokens, cwd)
+    tokens, model = transcript_usage(transcript)
+    size, known = detect_window(session_id, tokens, cwd, model)
     frac = tokens / size
     if frac < threshold():
         return None
@@ -379,8 +393,8 @@ def handle_statusline(payload: dict) -> str:
     reported = (payload.get("context_window") or {}).get("context_window_size")
     if isinstance(reported, int) and reported > 0:
         record_window(session_id, reported)
-    tokens = context_tokens(payload.get("transcript_path") or "")
-    size = window(session_id, tokens, project_root(payload))
+    tokens, model = transcript_usage(payload.get("transcript_path") or "")
+    size = window(session_id, tokens, project_root(payload), model)
     frac = tokens / size
     flag = " -> handoff" if frac >= threshold() else ""
     return f"ctx {frac:.0%} ({tokens // 1000}k/{size // 1000}k){flag}"
@@ -397,8 +411,8 @@ def handle_status(cwd: str) -> str:
     if not candidates:
         return f"No transcripts found for {cwd}; {where}"
     latest = candidates[-1]
-    tokens = context_tokens(str(latest))
-    size, known = detect_window(latest.stem, tokens, cwd)
+    tokens, model = transcript_usage(str(latest))
+    size, known = detect_window(latest.stem, tokens, cwd, model)
     guess = "" if known else " (window size unknown -- assumed; set CONTEXT_RELAY_WINDOW if larger)"
     return (
         f"{latest.name}: {tokens:,} tokens = {tokens / size:.0%} of {size:,}{guess} "

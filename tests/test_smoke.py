@@ -6,7 +6,8 @@ sh on POSIX), stdin/stdout JSON, exit codes and the install -> env wiring run fo
 instead of being mocked. One profile per host:
 
   cli-statusline  CLI installed with --statusline: Claude Code reports the window size there
-  desktop         Desktop app: no status line runs, model picked in the UI (no [1m] anywhere)
+  desktop         Desktop app: no status line runs, model picked in the UI (no [1m] anywhere),
+                  so the window comes from the transcript's model id
   desktop-window  Desktop app installed with --window 1000000
 
 What can't run here (the app's clear_session tool, the pinned / Remote Control fallback,
@@ -32,13 +33,13 @@ if str(_RELAY) not in sys.path:
 import install as ci  # noqa: E402
 
 
-def _assistant(tokens: int, sidechain: bool = False) -> dict:
+def _assistant(tokens: int, sidechain: bool = False, model: str = "claude-opus-5-5") -> dict:
     return {
         "type": "assistant",
         "isSidechain": sidechain,
         "message": {
             "role": "assistant",
-            "model": "claude-opus-5-5",  # what the desktop app records: no [1m] marker
+            "model": model,  # what the desktop app records: no [1m] marker
             "content": [{"type": "text", "text": "ok"}],
             "usage": {
                 "input_tokens": 3,
@@ -66,12 +67,12 @@ class Host:
         self.transcript = self.claude / "projects" / slug / f"{self.session_id}.jsonl"
         self.transcript.parent.mkdir(parents=True)
 
-    def at(self, tokens: int) -> None:
+    def at(self, tokens: int, model: str = "claude-opus-5-5") -> None:
         """Make the transcript look like a session with `tokens` in context."""
         entries = [
             {"type": "summary", "summary": "earlier work"},
             {"type": "user", "message": {"role": "user", "content": "keep going"}},
-            _assistant(tokens),
+            _assistant(tokens, model=model),
             _assistant(tokens * 2, sidechain=True),  # subagent usage must be ignored
             {"type": "system", "subtype": "info", "content": "hook ran"},
         ]
@@ -184,10 +185,18 @@ class TestHostProfiles:
         assert host.statusline(1_000_000) == "ctx 14% (145k/1000k)"
         assert host.stop() is None  # the recorded 1M window is used, not 200k
 
-    def test_desktop_unknown_window_never_auto_clears(self, tmp_path):
+    def test_desktop_detects_window_from_model(self, tmp_path):
         # Regression: a desktop-app 1M session at 145k was handed off as "73% (145k/200k)".
         host = Host(tmp_path)
         host.at(145_000)
+        assert host.stop() is None
+        status = host.cli("status", str(host.project))
+        assert "of 1,000,000" in status
+        assert "assumed" not in status
+
+    def test_desktop_unknown_model_never_auto_clears(self, tmp_path):
+        host = Host(tmp_path)
+        host.at(145_000, model="claude-future-9")
         reason = host.stop()["reason"]
         assert "Do NOT clear" in reason
         assert "clear_session" not in reason

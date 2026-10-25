@@ -34,12 +34,11 @@ merges `Stop` / `SessionStart` / `PreCompact` hooks into
 written first. `--statusline` shows `ctx 43% (86k/200k)` at the bottom if you
 don't already have a status line. Restart Claude Code afterwards.
 
-**Desktop app with a 1M model:** the app doesn't run status line commands, so
-the hook can't detect the window size there and assumes 200k. Install with
-`python install.py --window 1000000` to set `CONTEXT_RELAY_WINDOW`. It's
-global, so leave it out if you also use 200k-window sessions. Without it, a
-handoff triggered on a guessed size tells you the size was assumed and doesn't
-clear on its own.
+The window size (200k or 1M) is detected per session, in the CLI and the
+desktop app alike (see [Window size detection](#window-size-detection)). Only
+for a model the hook doesn't recognize does it assume 200k. A handoff
+triggered on that guess says so and doesn't clear on its own; install with
+`python install.py --window <tokens>` to set `CONTEXT_RELAY_WINDOW` in that case.
 
 Then turn **auto-compact off** in `/config`. The PreCompact hook still saves
 the full transcript if compaction ever fires anyway.
@@ -67,7 +66,7 @@ Set these in `~/.claude/settings.json` → `"env": {...}`:
 | Variable | Default | Meaning |
 |---|---|---|
 | `CONTEXT_RELAY_THRESHOLD` | `0.60` | Fraction of the window that triggers a handoff |
-| `CONTEXT_RELAY_WINDOW` | auto | Force the context window size in tokens (needed in the desktop app for a 1M window, see below) |
+| `CONTEXT_RELAY_WINDOW` | auto | Force the context window size in tokens (only needed for a model auto-detection doesn't know) |
 | `CONTEXT_RELAY_MAX_AGE_H` | `24` | Ignore older handoffs on a plain startup |
 
 ### Window size detection
@@ -80,9 +79,12 @@ Hooks aren't told the context window size, so it's resolved in this order:
 3. A `[1m]` model in `ANTHROPIC_MODEL` or in `~/.claude/settings.json` / the project's
    `.claude/settings*.json`.
 4. More than 200k tokens in use, which only an extended window can hold.
-5. Otherwise 200k. This is a guess, so the handoff says so and leaves the clear to you. `status` marks
-   it as assumed. The desktop app ends up here (no status line, and transcripts record a plain model
-   id with no `[1m]`), so set `CONTEXT_RELAY_WINDOW` there.
+5. The model id in the transcript. Current models (Opus 4.6+, Sonnet 4.6+, Haiku 5+, Fable, Mythos)
+   have a native 1M window, with no `[1m]` suffix. Older ones (Haiku 4.5, Sonnet/Opus 4.5 and
+   earlier) are 200k unless step 3 says `[1m]`. This step covers the desktop app, which runs no
+   status line.
+6. Otherwise 200k. This is a guess, so the handoff says so and leaves the clear to you. `status` marks
+   it as assumed. Set `CONTEXT_RELAY_WINDOW` if you hit this.
 
 On a 1M window the default 60% threshold means ~600k tokens. If you'd rather hand off sooner,
 lower `CONTEXT_RELAY_THRESHOLD` (e.g. `0.3` = ~300k).

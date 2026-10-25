@@ -5,7 +5,7 @@ them as subprocesses for each host profile. It can't drive a real Claude Code ho
 these by hand after changing hook output, Claude's instructions, `/handoff`, or `install.py`.
 Only the hosts whose behavior you changed need checking.
 
-Setup: `python install.py` (add `--window 1000000` for a 1M desktop session), then set
+Setup: `python install.py` (no `--window`: the window is detected from the model), then set
 `"CONTEXT_RELAY_THRESHOLD": "0.01"` in `~/.claude/settings.json` → `"env"` so the first
 turn triggers. Remove it afterwards.
 
@@ -24,10 +24,11 @@ Pinned session (or Remote Control on):
 - [ ] Claude says why it couldn't clear and ends with "Handoff saved -- type /clear to continue in a fresh session."
 - [ ] Typing `/clear` restores the handoff.
 
-1M model without `--window` (no status line in the app):
+Window size (no status line runs in the app, so it comes from the transcript's model id):
 
-- [ ] The handoff says the window size was assumed, and Claude does **not** clear.
-- [ ] `python ~/.claude/hooks/context_relay.py status` marks the size "assumed".
+- [ ] On a current model (e.g. Opus 5.5), `python ~/.claude/hooks/context_relay.py status` shows
+      `of 1,000,000` and does not say "assumed".
+- [ ] Unit/smoke tests cover an unrecognized model (assumed 200k, no auto-clear); no manual check needed.
 
 ## CLI
 

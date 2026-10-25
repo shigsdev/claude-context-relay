@@ -34,17 +34,18 @@ import context_relay as cr  # noqa: E402
 import install as ci  # noqa: E402
 
 
-def _assistant(tokens: int, sidechain: bool = False) -> dict:
+def _assistant(tokens: int, sidechain: bool = False, model: str = "") -> dict:
     return {
         "type": "assistant",
         "isSidechain": sidechain,
         "message": {
+            **({"model": model} if model else {}),
             "usage": {
                 "input_tokens": 2,
                 "cache_creation_input_tokens": 1000,
                 "cache_read_input_tokens": tokens - 1102,
                 "output_tokens": 100,
-            }
+            },
         },
     }
 
@@ -152,6 +153,43 @@ class TestWindowDetection:
         (auto / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
         assert cr.window("s1", 1, str(auto)) == cr.DEFAULT_WINDOW
 
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "us.anthropic.claude-opus-4-8-v1",
+        ],
+    )
+    def test_native_1m_model_is_detected(self, auto, model):
+        assert cr.detect_window("s1", 50_000, model=model) == (cr.EXTENDED_WINDOW, True)
+
+    @pytest.mark.parametrize(
+        "model", ["claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805"]
+    )
+    def test_200k_model_is_detected(self, auto, model):
+        assert cr.detect_window("s1", 50_000, model=model) == (cr.DEFAULT_WINDOW, True)
+
+    def test_unknown_model_is_still_a_guess(self, auto):
+        assert cr.detect_window("s1", 50_000, model="claude-future-9") == (cr.DEFAULT_WINDOW, False)
+        assert cr.detect_window("s1", 50_000, model="<synthetic>") == (cr.DEFAULT_WINDOW, False)
+
+    def test_1m_setting_beats_200k_model(self, auto):
+        # Sonnet 4.5 only gets 1M via "[1m]", and the transcript records the plain id.
+        self._settings(auto / ".claude", "sonnet[1m]")
+        assert cr.window("s1", 50_000, str(auto / "proj"), "claude-sonnet-4-5-20250929") == cr.EXTENDED_WINDOW
+
+    def test_desktop_1m_model_does_not_hand_off_at_145k(self, auto):
+        # Regression: the desktop app runs no status line, so a native 1M model was assumed 200k.
+        payload = _payload(auto, 145_000)
+        payload["transcript_path"] = _transcript(auto, {"type": "user"}, _assistant(145_000, model="claude-opus-5-5"))
+        assert cr.handle_stop(payload) is None
+
     def test_record_window_keeps_50_most_recent(self, auto):
         for i in range(60):
             cr.record_window(f"s{i}", 1_000_000)
@@ -187,6 +225,12 @@ class TestContextTokens:
     def test_missing_file_is_zero(self, tmp_path):
         assert cr.context_tokens(str(tmp_path / "nope.jsonl")) == 0
         assert cr.context_tokens(None) == 0
+        assert cr.transcript_usage(None) == (0, "")
+
+    def test_reports_last_real_model(self, tmp_path):
+        synthetic = {"type": "assistant", "message": {"model": "<synthetic>", "usage": {}}}
+        path = _transcript(tmp_path, _assistant(10_000, model="claude-opus-5-5"), synthetic)
+        assert cr.transcript_usage(path) == (10_000, "claude-opus-5-5")
 
 
 class TestStopHook:
